@@ -39,11 +39,15 @@ DEALINGS IN THE SOFTWARE.  */
 
 #include <curl/curl.h>
 
+// define a BAM_BLOCK size of each libcurl_seek() range request
+#define BAM_BLOCK 32768
+
 typedef struct {
     hFILE base;
     CURL *easy;
     struct curl_slist *headers;
     off_t file_size;
+    off_t pos; // Position of the seek request
     struct {
         union { char *rd; const char *wr; } ptr;
         size_t len;
@@ -54,6 +58,9 @@ typedef struct {
     unsigned closing : 1;   // informs callback that hclose() has been invoked
     unsigned finished : 1;  // wait_perform() tells us transfer is complete
 } hFILE_libcurl;
+
+// Declared earlier for use in process_messages()
+static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence);
 
 static int http_status_errno(int status)
 {
@@ -206,9 +213,17 @@ static void process_messages()
         curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **) &fp);
         switch (msg->msg) {
         case CURLMSG_DONE:
-            fp->finished = 1;
-            fp->final_result = msg->data.result;
-            break;
+            // If we receive message done but haven't reached the end of the 
+            // file then more data is needed so we seek the next block. A +1 
+            // is needed because http range requests are inclusive. 
+            if (fp->pos + BAM_BLOCK < fp->file_size) {
+                libcurl_seek((hFILE *)fp, fp->pos + BAM_BLOCK + 1, SEEK_SET);
+            }
+            else {
+                fp->finished = 1;
+                fp->final_result = msg->data.result;
+                break; 
+            }
 
         default:
             break;
@@ -257,6 +272,7 @@ static int wait_perform()
 
 static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv)
 {
+
     hFILE_libcurl *fp = (hFILE_libcurl *) fpv;
     size_t n = size * nmemb;
 
@@ -373,16 +389,18 @@ static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence)
     }
 
     pos = origin + offset;
+    fp->pos = pos;
 
     errm = curl_multi_remove_handle(curl.multi, fp->easy);
     if (errm != CURLM_OK) { errno = multi_errno(errm); return -1; }
     curl.nrunning--;
 
-    // TODO If we seem to be doing random access, use CURLOPT_RANGE to do
-    // limited reads (e.g. about a BAM block!) so seeking can reuse the
-    // existing connection more often.
+    // Create the string formatted for the CURLOPT_RANGE input and set the curl
+    // option to range request from pos to pos + BAM_BLOCK.
+    char buffer [200];
+    sprintf(buffer, "%llu-%llu", pos, pos + BAM_BLOCK);
+    err = curl_easy_setopt(fp->easy, CURLOPT_RANGE, buffer);
 
-    err = curl_easy_setopt(fp->easy, CURLOPT_RESUME_FROM_LARGE,(curl_off_t)pos);
     if (err != CURLE_OK) { errno = easy_errno(fp->easy, err); return -1; }
 
     fp->buffer.len = 0;
@@ -470,6 +488,8 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
     fp->buffer.len = 0;
     fp->final_result = (CURLcode) -1;
     fp->paused = fp->closing = fp->finished = 0;
+    // Initialize the position to be 0.
+    fp->pos = 0;
 
     fp->easy = curl_easy_init();
     if (fp->easy == NULL) { errno = ENOMEM; goto error; }
@@ -497,6 +517,10 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
     if (fp->headers)
         err |= curl_easy_setopt(fp->easy, CURLOPT_HTTPHEADER, fp->headers);
     err |= curl_easy_setopt(fp->easy, CURLOPT_FOLLOWLOCATION, 1L);
+
+    // Set log level for verbose for debugging purposes. 
+    // hts_set_log_level(8);
+
     if (hts_verbose <= 8)
         err |= curl_easy_setopt(fp->easy, CURLOPT_FAILONERROR, 1L);
     if (hts_verbose >= 8)
