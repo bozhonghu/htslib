@@ -39,8 +39,8 @@ DEALINGS IN THE SOFTWARE.  */
 
 #include <curl/curl.h>
 
-// define a BAM_BLOCK size of each libcurl_seek() range request
-#define BAM_BLOCK 32768
+// define a MAX_BLOCK size of each libcurl_seek() range request
+#define MAX_BLOCK 16000000
 
 typedef struct {
     hFILE base;
@@ -48,6 +48,9 @@ typedef struct {
     struct curl_slist *headers;
     off_t file_size;
     off_t pos; // Position of the seek request
+    int cont_req; // flag for whether it is a continuous large request.
+    off_t block_size; // The size of the seek range requests
+
     struct {
         union { char *rd; const char *wr; } ptr;
         size_t len;
@@ -216,8 +219,14 @@ static void process_messages()
             // If we receive message done but haven't reached the end of the 
             // file then more data is needed so we seek the next block. A +1 
             // is needed because http range requests are inclusive. 
-            if (fp->pos + BAM_BLOCK < fp->file_size) {
-                libcurl_seek((hFILE *)fp, fp->pos + BAM_BLOCK + 1, SEEK_SET);
+            if (fp->pos + fp->block_size < fp->file_size) {
+                // Seek the next block with twice the old block's size
+                off_t old_block_size = fp->block_size;
+                if (fp->block_size <= MAX_BLOCK){
+                    fp->block_size = fp->block_size * 2;
+                }
+                fp->cont_req = 1;
+                libcurl_seek((hFILE *)fp, fp->pos + old_block_size+1, SEEK_SET);
             }
             else {
                 fp->finished = 1;
@@ -272,7 +281,6 @@ static int wait_perform()
 
 static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv)
 {
-
     hFILE_libcurl *fp = (hFILE_libcurl *) fpv;
     size_t n = size * nmemb;
 
@@ -390,6 +398,9 @@ static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence)
 
     pos = origin + offset;
     fp->pos = pos;
+    // If it is not a consecutive request we reset the block size. 
+    if (fp->cont_req != 1) { fp->block_size = 32768; }
+    fp->cont_req = -1; 
 
     errm = curl_multi_remove_handle(curl.multi, fp->easy);
     if (errm != CURLM_OK) { errno = multi_errno(errm); return -1; }
@@ -398,7 +409,7 @@ static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence)
     // Create the string formatted for the CURLOPT_RANGE input and set the curl
     // option to range request from pos to pos + BAM_BLOCK.
     char buffer [200];
-    sprintf(buffer, "%llu-%llu", pos, pos + BAM_BLOCK);
+    sprintf(buffer, "%llu-%llu", pos, pos + fp->block_size);
     err = curl_easy_setopt(fp->easy, CURLOPT_RANGE, buffer);
 
     if (err != CURLE_OK) { errno = easy_errno(fp->easy, err); return -1; }
@@ -488,8 +499,9 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
     fp->buffer.len = 0;
     fp->final_result = (CURLcode) -1;
     fp->paused = fp->closing = fp->finished = 0;
-    // Initialize the position to be 0.
     fp->pos = 0;
+    fp->cont_req = -1;
+    fp->block_size = 32768; // Size of typical read block.
 
     fp->easy = curl_easy_init();
     if (fp->easy == NULL) { errno = ENOMEM; goto error; }
