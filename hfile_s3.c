@@ -220,6 +220,8 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
     const char *bucket, *path;
     char date_hdr[40];
     char *header_list[4], **header = header_list;
+    const char *boto_cfg = getenv("BOTO_CONFIG");
+    const char *boto_def = "~/.boto";
 
     kstring_t message = { 0, 0, NULL };
     kstring_t url = { 0, 0, NULL };
@@ -230,6 +232,7 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
     kstring_t token = { 0, 0, NULL };
     kstring_t token_hdr = { 0, 0, NULL };
     kstring_t auth_hdr = { 0, 0, NULL };
+    kstring_t addressing_style = { 0, 0, NULL };
 
     time_t now = time(NULL);
 #ifdef HAVE_GMTIME_R
@@ -246,6 +249,14 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
     *header++ = date_hdr;
     kputs(&date_hdr[6], &message);
     kputc('\n', &message);
+
+    // Load defaults from BOTO_CFG if it exists
+    parse_ini(boto_cfg ? boto_cfg : boto_def, "s3", "host", &host_base, 
+            "addressing_style", &addressing_style, NULL);
+    parse_ini(boto_cfg ? boto_cfg : boto_def, "Credentials",
+          "aws_access_key_id", &id, "aws_secret_access_key", &secret,
+          "aws_session_token", &token, NULL);
+    char *style = ks_str(&addressing_style);
 
     // Our S3 URL format is s3[+SCHEME]://[ID[:SECRET[:TOKEN]]@]BUCKET/PATH
 
@@ -288,11 +299,21 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
         else kputs("default", &profile);
     }
 
+    if (profile.l > 0) {
+    kstring_t profile_header = { 0, 0, NULL };
+    kputs("profile ", &profile_header);
+    kputs(profile.s, &profile_header);
+    parse_ini(boto_cfg ? boto_cfg : boto_def, profile_header.s,
+            "aws_access_key_id", &id, "aws_secret_access_key", &secret,
+            "aws_session_token", &token, "host", &host_base, NULL);
+    free(profile_header.s);
+    }
+
     if (id.l == 0) {
         const char *v = getenv("AWS_SHARED_CREDENTIALS_FILE");
         parse_ini(v? v : "~/.aws/credentials", profile.s,
                   "aws_access_key_id", &id, "aws_secret_access_key", &secret,
-                  "aws_session_token", &token, NULL);
+                  "aws_session_token", &token, "host_base", &host_base, NULL);
     }
     if (id.l == 0)
         parse_ini("~/.s3cfg", profile.s, "access_key", &id,
@@ -304,7 +325,7 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
     if (host_base.l == 0)
         kputs("s3.amazonaws.com", &host_base);
     // Use virtual hosted-style access if possible, otherwise path-style.
-    if (is_dns_compliant(bucket, path)) {
+    if (strcmp(style, "virtual") == 0 && is_dns_compliant(bucket, path)) {
         kputsn(bucket, path - bucket, &url);
         kputc('.', &url);
         kputs(host_base.s, &url);
