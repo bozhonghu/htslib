@@ -39,16 +39,15 @@ DEALINGS IN THE SOFTWARE.  */
 
 #include <curl/curl.h>
 
-// define a MAX_BLOCK size of each libcurl_seek() range request
-#define MAX_BLOCK 16000000
-#define RANGED 1
+#define RANGED 1 // flag for ranged request vs CURLOPT_RESUME_FROM_LARGE
+#define INITIAL_BLOCK 4000000 // default to 4 Mb if no environment var is set. 
 
 typedef struct {
     hFILE base;
     CURL *easy;
     struct curl_slist *headers;
     off_t file_size;
-    off_t pos; // Position of the seek request
+    off_t seek_pos; // Position of the seek request
     int cont_req; // flag for whether it is a continuous large request.
     off_t block_size; // The size of the seek range requests
 
@@ -63,7 +62,6 @@ typedef struct {
     unsigned finished : 1;  // wait_perform() tells us transfer is complete
 } hFILE_libcurl;
 
-// Declared earlier for use in process_messages()
 static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence);
 
 static int http_status_errno(int status)
@@ -217,24 +215,15 @@ static void process_messages()
         curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **) &fp);
         switch (msg->msg) {
             case CURLMSG_DONE: {
-                if (RANGED == 1) {
-                    // If we receive message done but haven't reached the end of the 
-                    // file then more data is needed so we seek the next block. A +1 
-                    // is needed because http range requests are inclusive. 
-                    if (fp->pos + fp->block_size < fp->file_size) {
-                        // Seek the next block with twice the old block's size
-                        off_t old_block_size = fp->block_size;
-                        if (fp->block_size <= MAX_BLOCK){
-                            fp->block_size = fp->block_size * 2;
-                        }
-                        fp->cont_req = 1;
-                        libcurl_seek((hFILE *)fp, fp->pos + old_block_size+1, SEEK_SET);
-                    }
-                    else {
-                        fp->finished = 1;
-                        fp->final_result = msg->data.result;
-                        break; 
-                    }
+                // If we receive message done but haven't reached the end of the 
+                // file then more data is needed so we seek the next block. A +1 
+                // is needed because http range requests are inclusive. 
+                if (RANGED && fp->seek_pos + fp->block_size < fp->file_size) {
+                    // Seek the next block with twice the old block's size
+                    off_t old_block_size = fp->block_size;
+                    fp->block_size = fp->block_size * 10;
+                    fp->cont_req = 1;
+                    libcurl_seek((hFILE *)fp, fp->seek_pos + old_block_size+1, SEEK_SET);
                 }
                 else {
                     fp->finished = 1;
@@ -307,11 +296,6 @@ static ssize_t libcurl_read(hFILE *fpv, void *bufferv, size_t nbytes)
     char *buffer = (char *) bufferv;
     CURLcode err;
 
-    // Logging the number of bytes read. 
-    FILE *f = fopen("bytes.txt", "a");
-    fprintf(f, "%zu\n", nbytes);
-    fclose(f);
-
     fp->buffer.ptr.rd = buffer;
     fp->buffer.len = nbytes;
     fp->paused = 0;
@@ -380,11 +364,6 @@ static ssize_t libcurl_write(hFILE *fpv, const void *bufferv, size_t nbytes)
 
 static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence)
 {
-    // Logging the number of requests. 
-    FILE *f = fopen("requests.txt", "a");
-    fprintf(f, "1\n");
-    fclose(f);
-
     hFILE_libcurl *fp = (hFILE_libcurl *) fpv;
 
     CURLcode err;
@@ -414,17 +393,17 @@ static off_t libcurl_seek(hFILE *fpv, off_t offset, int whence)
         return -1;
     }
 
-    pos = origin + offset; 
+    pos = origin + offset;
+    fp->seek_pos = pos;
 
     errm = curl_multi_remove_handle(curl.multi, fp->easy);
     if (errm != CURLM_OK) { errno = multi_errno(errm); return -1; }
     curl.nrunning--;
 
-    if ( RANGED == 1 ) {
-        fp->pos = pos;
+    if (RANGED) {
         // If it is not a consecutive request we reset the block size. 
         if (fp->cont_req != 1) { 
-            fp->block_size = 32768;
+            fp->block_size = INITIAL_BLOCK;
             // Grab initial block size from environment variable for testing. 
             char *env_bam = getenv ("BAM_BLOCK");
             if (env_bam != NULL) {
@@ -504,21 +483,24 @@ static const struct hFILE_backend libcurl_backend =
 };
 
 /* Called each time a header is received this function is called. Checks if 
- * the header is 'Content-Range' in order to grab the file size and writes it
- * to the buffer pointed to by userdata. */
+ * the header is 'Content-Range' in order to grab the file size. */
 size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata){
     size_t numbytes = size * nitems;
-    char *f_size = (char *)userdata;
-    if (strncmp(buffer, "Content-Range", 13) == 0) {
-        int i = 0;
-        while ( buffer[i] != '/' ) { i++; }
-        i++;
-        int j = 0;
-        while ( buffer[i] != '\0' ) { 
-            f_size[j] = buffer[i];
-            j++;
-            i++;
-        }
+    hFILE_libcurl *fp = (hFILE_libcurl *)userdata;
+    if (numbytes <= 14) { return numbytes; }
+    if (strncmp(buffer, "Content-Range:", 14) == 0) {
+        /* The file size is after a '/' in the content-range header but extra
+         * processing is necessary because the header is not required to be
+         * null terminated. */
+        char *f_size = (char*) memchr(buffer, '/', numbytes) + 1;
+        if (f_size == NULL) { return numbytes; }
+        char *end = buffer + numbytes;
+        char *temp = malloc(end - f_size + 1);
+        memcpy(temp, f_size, end - f_size);
+        temp[end - f_size + 1] = '\0';
+        off_t fsize = strtoll(temp, NULL, 10);
+        fp->file_size = fsize;
+        free(temp);
     }
     return numbytes;
 }
@@ -550,9 +532,9 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
     fp->buffer.len = 0;
     fp->final_result = (CURLcode) -1;
     fp->paused = fp->closing = fp->finished = 0;
-    fp->pos = 0;
+    fp->seek_pos = 0;
     fp->cont_req = -1;
-    fp->block_size = 32768; // Size of typical read block.
+    fp->block_size = INITIAL_BLOCK;
     // Grab initial block size from environment variable for testing. 
     char *env_bam = getenv ("BAM_BLOCK");
     if (env_bam != NULL) {
@@ -587,21 +569,18 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
         err |= curl_easy_setopt(fp->easy, CURLOPT_HTTPHEADER, fp->headers);
     err |= curl_easy_setopt(fp->easy, CURLOPT_FOLLOWLOCATION, 1L);
 
-    // Set log level for verbose for debugging purposes. 
-    // hts_set_log_level(8);
-
     if (hts_verbose <= 8)
         err |= curl_easy_setopt(fp->easy, CURLOPT_FAILONERROR, 1L);
     if (hts_verbose >= 8)
         err |= curl_easy_setopt(fp->easy, CURLOPT_VERBOSE, 1L);
 
     // Make the initial request a ranged one instead and set up the headercallback
-    // in order to extract the file size from the content range header. 
-    err |= curl_easy_setopt(fp->easy, CURLOPT_RANGE, "0-32768");
+    // in order to extract the file size from the content range header.
+    char buffer [200];
+    sprintf(buffer, "%i-%llu", 0, fp->block_size); 
+    err |= curl_easy_setopt(fp->easy, CURLOPT_RANGE, buffer);
     err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERFUNCTION, header_callback);
-    // Buffer for the file size. File size should be within 20 digits. 
-    char f_size[20];
-    err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, &f_size);
+    err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, fp);
 
     if (err != 0) { errno = ENOSYS; goto error; }
 
@@ -616,21 +595,11 @@ libcurl_open(const char *url, const char *modes, struct curl_slist *headers)
      * range and also set the file size. */
     err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERFUNCTION, NULL);
     err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, NULL);
-    off_t fsize = strtoll(f_size, NULL, 10);
-    fp->file_size = fsize;
 
     if (fp->finished && fp->final_result != CURLE_OK) {
         errno = easy_errno(fp->easy, fp->final_result);
         goto error_remove;
     }
-
-    // if (mode == 'r') {
-    //     double dval;
-    //     if (curl_easy_getinfo(fp->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD,
-    //                           &dval) == CURLE_OK && dval >= 0.0)
-    //         fp->file_size = (off_t) (dval + 0.1);
-    //         printf("The file size was set to %llu\n", fp->file_size);
-    // }
 
     fp->base.backend = &libcurl_backend;
     return &fp->base;
